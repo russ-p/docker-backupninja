@@ -1,0 +1,159 @@
+# -*- mode: sh; sh-basic-offset: 3; indent-tabs-mode: nil; -*-
+# vim: set filetype=sh sw=3 sts=3 expandtab autoindent:
+#
+# git handler script for backupninja
+
+# List of repository directories, or a container directory
+# (if repositories_is_container_dir is "yes")
+getconf repositories    ""
+
+# "yes" = the repositories option refers to a container
+#         directory that holds the repositories to backup;
+#         repositories are sub-directories whose name ends
+#         in ".git".
+# "no" = the repositories option is a list of repository
+#        directories
+getconf repositories_is_container_dir   no
+
+# "yes" = create tar ball directly from repository directory
+# "no" = create tar ball from a temporary clone of repository
+getconf repositories_are_bare_repos   yes
+
+# Supported values are compress, gzip, bzip and none. The
+# value of this option also determines the extension that
+# is used for the backup file.
+getconf compress        bzip
+
+# Backup files are created in this folder. Each repository
+# gets its own backup file that is named after the repository
+# directory. For instance, /var/gitolite3/repositories/foo.git
+# will be backed up to foo.git.bz2 (or whatever extension
+# the "compress" option suggests).
+getconf backupdir       "/var/backups/git"
+
+getconf GIT             `which git`
+getconf TAR             `which tar`
+getconf EXTENSION       tar
+
+if test -z "$repositories"; then
+   fatal "Repository list is empty"
+fi
+
+case $repositories_is_container_dir in
+   "yes")
+      repositories="$(ls -d $repositories/*.git)"
+      ;;
+   "no")
+      ;;
+   *)
+      warning "Unknown repositories_is_container_dir value ($repositories_is_container_dir)"
+      ;;
+esac
+
+if [ ! -d "$backupdir" ]
+then
+   mkdir -p "$backupdir" || fatal "Can not make directory $backupdir"
+fi
+
+if [ ! -w "$backupdir" ]
+then
+   fatal "Directory $backupdir is not writable"
+fi
+
+case $compress in
+   "compress")
+      compress_option="-Z"
+      EXTENSION="tar.compress"
+      ;;
+   "gzip")
+      compress_option="-z"
+      EXTENSION="tgz"
+      ;;
+   "bzip")
+      compress_option="-j"
+      EXTENSION="tar.bz2"
+      ;;
+   "none")
+      compress_option=""
+      ;;
+   *)
+      warning "Unknown compress filter ($tar_compress)"
+      compress_option=""
+      ;;
+esac
+
+## DO IT #################################################
+
+for repository in $repositories
+do
+  if test ! -d "$repository"; then
+    warning "Repository is not a directory: $repository"
+    continue
+  fi
+
+  case $repositories_are_bare_repos in
+     "yes")
+        BARE_REPO_NAME="$(basename "$repository")"
+        BARE_REPO_PATH="$repository"
+        BARE_REPO_PARENTDIR="$(dirname "$repository")"
+        ;;
+     "no")
+        BARE_REPO_NAME="$(basename "$repository").git"
+        BARE_REPO_PATH="/tmp/$BARE_REPO_NAME"
+        BARE_REPO_PARENTDIR="/tmp"
+        ;;
+     *)
+        warning "Unknown repositories_are_bare_repos value ($repositories_are_bare_repos)"
+        BARE_REPO_NAME="$(basename "$repository")"
+        BARE_REPO_PATH="$repository"
+        BARE_REPO_PARENTDIR="$(dirname "$repository")"
+        ;;
+  esac
+
+  TAR_FILE_BASENAME="$backupdir/$BARE_REPO_NAME"
+  TAR_FILE="$TAR_FILE_BASENAME.$EXTENSION"
+
+  if test "$repositories_are_bare_repos" = "no"; then
+    debug "Running backup: git clone --mirror $repository $BARE_REPO_PATH; cd $BARE_REPO_PARENTDIR; $TAR -c -p -v $compress_option -f $TAR_FILE ./$BARE_REPO_NAME"
+  else
+    debug "Running backup: cd $BARE_REPO_PARENTDIR; $TAR -c -p -v $compress_option -f $TAR_FILE ./$BARE_REPO_NAME"
+  fi
+
+  if test ! $test; then
+    if test "$repositories_are_bare_repos" = "no"; then
+      info "Cloning repository $repository into $BARE_REPO_PATH"
+      git clone --mirror "$repository" "$BARE_REPO_PATH" 2>/dev/null
+      [ $? -ne 0 ] && fatal "Failed to clone/mirror repository $repository into $BARE_REPO_PATH"
+    fi
+
+    cd "$BARE_REPO_PARENTDIR"
+    [ $? -ne 0 ] && fatal "Failed to change working directory to $BARE_REPO_PARENTDIR"
+
+    $TAR -c -p -v $compress_option \
+       -f "$TAR_FILE" \
+       "./$BARE_REPO_NAME" \
+       > "$TAR_FILE_BASENAME.list" \
+       2> "$TAR_FILE_BASENAME.err"
+    TAR_RESULT=$?
+
+    # Must switch back to original working directory even if
+    # tar failed, otherwise master program may run into trouble
+    cd - >/dev/null
+
+    if test "$repositories_are_bare_repos" = "no"; then
+      # This case statement is guarding against internal programming
+      # errors. rm -r is dangerous, we wouldn't want to wipe someone's
+      # machine.
+      case "$BARE_REPO_PATH" in
+        /tmp/*)
+          rm -r "$BARE_REPO_PATH"
+          ;;
+        *)
+          fatal "Internal error: temporary bare repo path is not in /tmp"
+          ;;
+      esac
+    fi
+
+    [ $TAR_RESULT -ne 0 ] && fatal "Tar backup failed"
+  fi
+done
